@@ -1,0 +1,38 @@
+# containerd config.toml for Kubernetes
+# This configures containerd to use systemd as the cgroup driver,
+# which is required by kubelet.
+# https://kubernetes.io/docs/setup/production-environment/container-runtimes/
+
+# Replace this with the content from 'containerd config default' and then modify.
+# For simplicity, this template provides a minimal configuration focused on CRI.
+# You might want to get 'sudo containerd config default' from a fresh system
+# and then add/modify this section specifically.
+
+version = 2
+[plugins]
+  [plugins."io.containerd.grpc.v1.cri"]
+    # cri_config_version indicates the API version of CRI plugin.
+    # The default is "v1".
+    cri_config_version = "v1"
+
+    # Default CRI socket path
+    # socket_path is the path to the CRI socket.
+    # The default is "/run/containerd/containerd.sock".
+    # socket_path = "/run/containerd/containerd.sock"
+
+    # rdt_config contains the config for RDT.
+    [plugins."io.containerd.grpc.v1.cri".containerd]
+      # default_runtime_name is the default runtime name to use.
+      # The default is "runc".
+      default_runtime_name = "runc"
+      # If you're using systemd, this must be set to true.
+      # This is the crucial part for Kubernetes + systemd.
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+        [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+          runtime_type = "io.containerd.runc.v2"
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+            SystemdCgroup = true
+
+    # The rest of the default config can be appended here if needed.
+    # For a full default config, you can generate it with 'containerd config default'
+    # and then ensure the SystemdCgroup part is set to true.

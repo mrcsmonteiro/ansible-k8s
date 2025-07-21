@@ -1,0 +1,145 @@
+---
+- name: Common Kubernetes Setup
+  hosts: k8s_cluster
+  become: true # Run tasks with sudo (requires passwordless sudo or --ask-become-pass)
+  tasks:
+    - name: Update apt cache and install necessary packages
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl # Ensure curl is installed for fetching GPG key
+          - gnupg2 # Ensure gnupg2 is installed for dearmoring GPG key
+          - software-properties-common
+          - runc # Ensure runc, the default containerd runtime, is installed
+        state: present
+        update_cache: yes # Ensures apt cache is refreshed before installing
+
+    - name: Disable swap permanently
+      ansible.builtin.mount:
+        name: "{{ item }}"
+        fstype: swap
+        state: absent
+      with_items:
+        - swap
+        - none
+      # This removes swap entries from /etc/fstab
+
+    - name: Disable swap for current session
+      ansible.builtin.command: swapoff -a
+      when: ansible_swaptotal_mb > 0 # Only run if swap is active
+      changed_when: false # This command often reports changes even if no swap was active, so we suppress it
+
+    - name: Add kernel modules for Kubernetes
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+      # These modules are required by Kubernetes for networking (overlayfs for container images, bridge-netfilter for CNI)
+
+    - name: Load kernel modules
+      ansible.builtin.command: modprobe "{{ item }}"
+      with_items:
+        - overlay
+        - br_netfilter
+      changed_when: false # Suppress changed state for idempotent modprobe
+
+    - name: Configure sysctl parameters for Kubernetes
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/kubernetes.conf
+        content: |
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+      # These sysctl settings enable necessary network forwarding and bridge filtering for Kubernetes
+
+    - name: Apply sysctl parameters
+      ansible.builtin.command: sysctl --system
+      changed_when: false # Suppress changed state for idempotent sysctl
+
+    - name: Add Docker GPG key
+      ansible.builtin.apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+        keyring: /etc/apt/keyrings/docker.gpg # Using keyring for modern apt best practices
+
+    - name: Add Docker APT repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch={{ 'amd64' if ansible_architecture == 'x86_64' else ansible_architecture }} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+        filename: docker # Creates /etc/apt/sources.list.d/docker.list
+
+    - name: Install containerd.io
+      ansible.builtin.apt:
+        name: containerd.io
+        state: present
+        update_cache: yes
+
+    # --- START of REVISED containerd Config Deployment ---
+    - name: Deploy containerd config.toml with systemd cgroup driver
+      ansible.builtin.template:
+        src: templates/containerd.toml.j2 # Path to the template file on your Ansible controller
+        dest: /etc/containerd/config.toml
+        mode: '0644'
+      # This ensures the config is precisely what we want, overriding any defaults that might conflict.
+
+    - name: Ensure containerd service is enabled and running
+      ansible.builtin.systemd_service:
+        name: containerd
+        state: started
+        enabled: yes
+
+    - name: Force daemon-reload for containerd
+      ansible.builtin.systemd_service:
+        name: containerd
+        daemon_reload: yes
+
+    - name: Restart containerd service for config changes to take effect
+      ansible.builtin.systemd_service:
+        name: containerd
+        state: restarted
+
+    - name: Pause for 5 seconds to allow containerd to fully start
+      ansible.builtin.pause:
+        seconds: 5
+    # --- END of REVISED containerd Config Deployment ---
+
+    # --- START of Kubernetes APT Repository Setup (Revised & Corrected) ---
+    - name: Create directory for Kubernetes GPG key
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download and dearmor Kubernetes GPG key
+      ansible.builtin.shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ kube_version.split('.')[0] }}.{{ kube_version.split('.')[1] }}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes APT repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kube_version.split('.')[0] }}.{{ kube_version.split('.')[1] }}/deb/ /"
+        state: present
+        filename: kubernetes
+        update_cache: yes
+
+    # --- END of Kubernetes APT Repository Setup ---
+
+    - name: Install kubelet, kubeadm, and kubectl
+      ansible.builtin.apt:
+        name:
+          - kubelet={{ kube_version }}-1.1
+          - kubeadm={{ kube_version }}-1.1
+          - kubectl={{ kube_version }}-1.1
+        state: present
+        update_cache: yes
+
+    - name: Hold Kubernetes packages from being upgraded
+      ansible.builtin.command: apt-mark hold kubelet kubeadm kubectl
+      changed_when: false
+
+    - name: Pull Kubernetes images ahead of time (Master node only)
+      ansible.builtin.command: kubeadm config images pull --kubernetes-version v{{ kube_version }}
+      when: inventory_hostname == groups['kube_master'][0] # Only run on the first master node

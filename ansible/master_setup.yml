@@ -1,0 +1,187 @@
+---
+- name: Initialize Kubernetes Master Node
+  hosts: kube_master
+  become: true # Run all tasks with sudo privileges on the remote master node
+
+  vars:
+    pod_network_cidr: "10.244.0.0/16" # Default Calico CIDR
+
+  tasks:
+    - name: Gathering Facts # Ensure facts are gathered for conditional checks (e.g., os_family)
+      ansible.builtin.setup:
+
+    - name: Ensure local kubeconfig directory exists for idempotency checks
+      ansible.builtin.file:
+        path: "/tmp/kubeconfig/{{ inventory_hostname }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+
+    - name: Get stat for local admin.conf on controller (for existence check before kubectl)
+      ansible.builtin.stat:
+        path: "/tmp/kubeconfig/{{ inventory_hostname }}/admin.conf"
+      register: local_admin_conf_stat
+      delegate_to: localhost
+      run_once: true
+      ignore_errors: true # This might fail if path doesn't exist initially
+
+    - name: Check if Kubernetes control plane is already initialized
+      ansible.builtin.command: >
+        kubectl --kubeconfig={{ '/tmp/kubeconfig/' + inventory_hostname + '/admin.conf' if local_admin_conf_stat.stat.exists else '/dev/null' }}
+        get nodes -o custom-columns=STATUS:.status.conditions[?(@.type==Ready)].status --no-headers
+      register: kube_nodes_status
+      ignore_errors: true # Ignore error if kubectl is not yet configured or cluster not ready
+      changed_when: false # This task does not change state
+      delegate_to: localhost # Run this check on the controller, using its local kubectl
+
+    - name: Reset Kubernetes cluster if necessary (based on previous run attempts)
+      ansible.builtin.command: kubeadm reset -f
+      when: kube_nodes_status.rc != 0
+      ignore_errors: true # Ignore errors if reset fails (e.g., nothing to reset)
+      changed_when: true # Assume a reset changes state if it runs
+
+    - name: Initialize the Kubernetes cluster
+      ansible.builtin.command: kubeadm init --pod-network-cidr={{ pod_network_cidr }}
+      register: kubeadm_init_output
+      when: kube_nodes_status.rc != 0
+
+    # Add firewall rules *after* kubeadm init (as kubeadm might start API server),
+    # but *before* attempting kubectl commands from the controller.
+    - name: Ensure necessary ports are open (firewalld - RedHat/CentOS)
+      ansible.posix.firewalld:
+        port: "{{ item }}/tcp"
+        state: enabled
+        permanent: true
+        immediate: true
+      loop:
+        - 6443 # Kubernetes API server
+        - 2379-2380 # etcd server client API
+        - 10250 # Kubelet API
+        - 10257 # kube-controller-manager
+        - 10259 # kube-scheduler
+      when: ansible_facts['os_family'] == "RedHat"
+      ignore_errors: true
+
+    - name: Ensure necessary ports are open (ufw - Debian/Ubuntu)
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - 6443
+        - 2379:2380
+        - 10250
+        - 10257
+        - 10259
+      when: ansible_facts['os_family'] == "Debian"
+      ignore_errors: true
+
+    - name: Pause for 10 seconds to allow kubeadm to fully write files and start components
+      ansible.builtin.pause:
+        seconds: 10
+      when: kubeadm_init_output is defined and kubeadm_init_output.changed
+
+    - name: Get stat for admin.conf file on remote host (should exist now)
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: admin_conf_stat
+      ignore_errors: true
+
+    - name: Get stat for user's kubeconfig file
+      ansible.builtin.stat:
+        path: /home/{{ ansible_user }}/.kube/config
+      register: user_kubeconfig_stat
+      ignore_errors: true
+
+    - name: Get content of user's .bashrc file
+      ansible.builtin.slurp:
+        src: /home/{{ ansible_user }}/.bashrc
+      register: user_bashrc_content
+      ignore_errors: true
+
+    - name: Create .kube directory for your_ssh_user
+      ansible.builtin.file:
+        path: /home/{{ ansible_user }}/.kube
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Copy admin.conf to your_ssh_user's .kube directory
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ ansible_user }}/.kube/config
+        remote_src: true
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+      when: admin_conf_stat.stat.exists and (kubeadm_init_output is defined and kubeadm_init_output.rc == 0 or (user_kubeconfig_stat is defined and not user_kubeconfig_stat.stat.exists))
+
+    - name: Set KUBECONFIG environment variable for current user (on master node)
+      ansible.builtin.lineinfile:
+        path: "/home/{{ ansible_user }}/.bashrc"
+        line: "export KUBECONFIG=/home/{{ ansible_user }}/.kube/config"
+        create: true
+        state: present
+        insertafter: EOF
+      when: (kubeadm_init_output is defined and kubeadm_init_output.rc == 0) or (user_bashrc_content is defined and 'KUBECONFIG' not in (user_bashrc_content['content'] | b64decode))
+
+    # --- Kubeconfig Sync to Controller (CRITICAL CHANGE HERE) ---
+    - name: Read admin.conf from remote master (if kubeadm init was run)
+      ansible.builtin.slurp:
+        src: /etc/kubernetes/admin.conf
+      register: admin_conf_content
+      when: kubeadm_init_output is defined and kubeadm_init_output.changed # Only slurp if kubeadm init actually ran and changed things
+
+    - name: Write admin.conf to local controller (always overwrite if slurped)
+      ansible.builtin.copy:
+        content: "{{ admin_conf_content.content | b64decode }}"
+        dest: "/tmp/kubeconfig/{{ inventory_hostname }}/admin.conf"
+        mode: '0644'
+      delegate_to: localhost
+      run_once: true
+      when: admin_conf_content is defined and admin_conf_content.content is defined # Only write if content was slurped
+
+    # --- Debugging Steps ---
+    - name: DEBUG - Verify kubectl version on localhost
+      ansible.builtin.command: kubectl version --client
+      register: kubectl_client_version
+      delegate_to: localhost
+      run_once: true
+      changed_when: false
+    - name: DEBUG - Print kubectl client version
+      ansible.builtin.debug:
+        var: kubectl_client_version.stdout_lines
+      delegate_to: localhost
+      run_once: true
+
+    - name: Wait for Kubernetes API server to be ready and responsive
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 6443
+        delay: 5
+        timeout: 120
+        state: started
+      delegate_to: localhost
+      run_once: true
+
+    - name: Check Kubernetes cluster health after wait (using fresh kubeconfig)
+      ansible.builtin.command: kubectl --kubeconfig=/tmp/kubeconfig/{{ inventory_hostname }}/admin.conf cluster-info
+      register: cluster_info_output
+      delegate_to: localhost
+      run_once: true
+      # No ignore_errors here - we expect this to succeed now!
+      changed_when: false
+    - name: Print cluster health info
+      ansible.builtin.debug:
+        var: cluster_info_output.stdout_lines
+      delegate_to: localhost
+      run_once: true
+
+    - name: Install Calico Pod Network
+      become: false
+      ansible.builtin.command: kubectl --kubeconfig=/tmp/kubeconfig/{{ inventory_hostname }}/admin.conf apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml --validate=false --insecure-skip-tls-verify
+      delegate_to: localhost
+      run_once: true
+      when: cluster_info_output is defined and cluster_info_output.rc == 0 # Only if cluster-info succeeded
