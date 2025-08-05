@@ -3,6 +3,39 @@
   hosts: kube_workers
   become: true
   tasks:
+    - name: Ensure necessary ports are open (firewalld - RedHat/CentOS)
+      ansible.posix.firewalld:
+        port: "{{ item }}/tcp"
+        state: enabled
+        permanent: true
+        immediate: true
+      loop:
+        - 179 # Calico's BGP
+        - 6443 # Kubernetes API server
+        - 2379-2380 # etcd server client API
+        - 10250 # Kubelet API
+        - 10255 # Kubelet read-only
+        - 10257 # kube-controller-manager
+        - 10259 # kube-scheduler
+      when: ansible_facts['os_family'] == "RedHat"
+      ignore_errors: true
+
+    - name: Ensure necessary ports are open (ufw - Debian/Ubuntu)
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - 179
+        - 6443
+        - 2379:2380
+        - 10250
+        - 10255
+        - 10257
+        - 10259
+      when: ansible_facts['os_family'] == "Debian"
+      ignore_errors: true
+
     - name: Get join command from master
       ansible.builtin.command: kubeadm token create --print-join-command
       delegate_to: master_node

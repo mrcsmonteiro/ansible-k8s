@@ -55,9 +55,11 @@
         permanent: true
         immediate: true
       loop:
+        - 179 # Calico's BGP
         - 6443 # Kubernetes API server
         - 2379-2380 # etcd server client API
         - 10250 # Kubelet API
+        - 10255 # Kubelet read-only
         - 10257 # kube-controller-manager
         - 10259 # kube-scheduler
       when: ansible_facts['os_family'] == "RedHat"
@@ -73,6 +75,7 @@
         - 6443
         - 2379:2380
         - 10250
+        - 10255
         - 10257
         - 10259
       when: ansible_facts['os_family'] == "Debian"
